@@ -1,0 +1,18 @@
+# secrets
+.env
+
+# runtime databases
+*.db
+
+# logs
+*.log
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# editors
+.vscode/
+*.swp
