@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: polytrack
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn dashboard:app -c gunicorn.conf.py
+    envVars:
+      - key: WALLETS
+        sync: false
+      - key: DISCORD_WEBHOOK_URL
+        sync: false
+      - key: MY_BASE_UNIT
+        value: "100"
+      - key: MY_BANKROLL
+        value: "10000"
+      - key: DASHBOARD_REFRESH
+        value: "60"
+      - key: MIN_AMERICAN_ODDS
+        value: "-250"
+      - key: MAX_AMERICAN_ODDS
+        value: "250"
+      - key: POLYMARKET_ANALYTICS_STATS
+        value: "true"
+      - key: RESOLVE_WINDOW_DAYS
+        value: "2"
