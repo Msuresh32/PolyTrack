@@ -1395,6 +1395,213 @@ def api_backtest_snapshots():
     return jsonify({"data": [dict(r) for r in rows]})
 
 
+@app.route("/export")
+def export_excel():
+    import io
+    from flask import send_file
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import PatternFill, Font, Alignment
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        return "openpyxl not installed — run: pip install openpyxl", 500
+
+    with _lock:
+        positions = list(_cache.get("data") or [])
+
+    # ── style helpers ──────────────────────────────────────────────────────────
+    def fill(hex6):
+        return PatternFill("solid", fgColor="FF" + hex6.lstrip("#").upper())
+
+    def fnt(hex6, bold=False, size=10):
+        return Font(color="FF" + hex6.lstrip("#").upper(), bold=bold, size=size)
+
+    HDR_FILL = fill("0D1F16")
+    HDR_FONT = fnt("34C759", bold=True, size=10)
+    YES_FILL = fill("0A1F12")
+    NO_FILL  = fill("1F0D0D")
+    MLT_FILL = fill("1F1700")
+    DEF_FILL = fill("111814")
+    POS_FONT = fnt("34C759", bold=True)
+    NEG_FONT = fnt("F0606E", bold=True)
+    GLD_FONT = fnt("E6A817", bold=True)
+    WHT_FONT = fnt("D8EBE0")
+    DIM_FONT = fnt("5A7A68")
+    CENTER   = Alignment(horizontal="center", vertical="center")
+    LEFT     = Alignment(horizontal="left", vertical="center", wrap_text=False)
+
+    def hdr_row(ws, headers):
+        for col, (title, width) in enumerate(headers, 1):
+            c = ws.cell(1, col, title)
+            c.fill = HDR_FILL
+            c.font = HDR_FONT
+            c.alignment = CENTER
+            ws.column_dimensions[get_column_letter(col)].width = width
+        ws.freeze_panes = "A2"
+        ws.row_dimensions[1].height = 22
+
+    def sc(ws, row, col, val, f=None, fn=None, al=None, fmt=None):
+        c = ws.cell(row, col, val)
+        if f:   c.fill            = f
+        if fn:  c.font            = fn
+        if al:  c.alignment       = al
+        if fmt: c.number_format   = fmt
+        return c
+
+    wb = Workbook()
+
+    # ── Sheet 1: Open Positions ────────────────────────────────────────────────
+    ws1 = wb.active
+    ws1.title = "Open Positions"
+    hdr_row(ws1, [
+        ("Conv", 6), ("Sport", 11), ("Market", 46), ("Side", 6),
+        ("Entry Odds", 11), ("Cur Odds", 9), ("Invested $", 11),
+        ("Cur Value $", 11), ("P&L $", 10), ("ROI %", 8),
+        ("Tail $", 8), ("Aligned", 8), ("Sharp Wallets", 28), ("Ends", 12),
+    ])
+    for ri, pos in enumerate(positions, 2):
+        outcome  = pos.get("outcome", "")
+        rf       = YES_FILL if outcome == "Yes" else (NO_FILL if outcome == "No" else MLT_FILL)
+        pl       = as_float(pos.get("row_pl", 0))
+        roi      = as_float(pos.get("row_roi_pct", 0))
+        sf       = (fnt("34C759", bold=True) if outcome == "Yes"
+                    else fnt("F0606E", bold=True) if outcome == "No" else GLD_FONT)
+        ends     = (pos.get("end_date") or pos.get("resolution_time") or "")[:10]
+        for ci, (v, fn, al, fmt) in enumerate([
+            (pos.get("conviction", 0),              fnt("E0ECE4", bold=True), CENTER, None),
+            (pos.get("category", ""),               DIM_FONT, CENTER, None),
+            (pos.get("market", ""),                 WHT_FONT, LEFT,   None),
+            (outcome,                               sf,       CENTER, None),
+            (pos.get("avg_odds", ""),               DIM_FONT, CENTER, None),
+            (pos.get("cur_odds", ""),               WHT_FONT, CENTER, None),
+            (as_float(pos.get("size_usd", 0)),      DIM_FONT, CENTER, "#,##0.00"),
+            (as_float(pos.get("current_value", 0)), WHT_FONT, CENTER, "#,##0.00"),
+            (pl,  POS_FONT if pl  > 0 else NEG_FONT if pl  < 0 else WHT_FONT, CENTER, "#,##0.00"),
+            (roi, POS_FONT if roi > 0 else NEG_FONT if roi < 0 else WHT_FONT, CENTER, "0.00"),
+            (as_float(pos.get("tail_stake", 0)),    DIM_FONT, CENTER, "0.00"),
+            (pos.get("sharp_wallet_count", 0),      DIM_FONT, CENTER, None),
+            (pos.get("sharp_wallets", ""),          DIM_FONT, LEFT,   None),
+            (ends,                                  DIM_FONT, CENTER, None),
+        ], 1):
+            sc(ws1, ri, ci, v, f=rf, fn=fn, al=al, fmt=fmt)
+        ws1.row_dimensions[ri].height = 17
+
+    # ── Sheet 2: Sharp Wallet DB ───────────────────────────────────────────────
+    ws2 = wb.create_sheet("Sharp Wallet DB")
+    hdr_row(ws2, [
+        ("Label", 16), ("Address", 44), ("Sport", 12),
+        ("Sharpness", 11), ("Win Rate %", 11), ("Markets", 10),
+        ("Wins", 8), ("Volume $", 14), ("P&L $", 14),
+        ("ROI %", 8), ("Rank", 6),
+    ])
+    sharp_data = []
+    if os.path.exists(SHARP_WALLETS_FILE):
+        try:
+            with open(SHARP_WALLETS_FILE, "r", encoding="utf-8") as f_:
+                sharp_data = json.load(f_).get("wallets", [])
+        except Exception:
+            pass
+    for ri, w in enumerate(sharp_data, 2):
+        wr      = as_float(w.get("win_rate", 0))
+        roi_v   = as_float(w.get("roi_pct", 0))
+        pl_v    = as_float(w.get("total_pnl", 0))
+        sharp_v = as_float(w.get("sharpness_score", 0))
+        for ci, (v, fn, al, fmt) in enumerate([
+            (w.get("wallet_label", ""),                     WHT_FONT, LEFT,   None),
+            (w.get("wallet_address", ""),                   DIM_FONT, LEFT,   None),
+            (w.get("category", ""),                         DIM_FONT, CENTER, None),
+            (sharp_v, GLD_FONT if sharp_v >= 70 else WHT_FONT, CENTER, "0.0"),
+            (wr, fnt("34C759", bold=True) if wr >= 55 else fnt("F0606E", bold=True) if wr < 50 else WHT_FONT, CENTER, "0.00"),
+            (int(as_float(w.get("number_of_resolved_positions", 0))), DIM_FONT, CENTER, None),
+            (int(as_float(w.get("win_count", 0))),          fnt("34C759"), CENTER, None),
+            (as_float(w.get("total_volume", 0)),            DIM_FONT, CENTER, "#,##0"),
+            (pl_v, POS_FONT if pl_v > 0 else NEG_FONT,     CENTER, "#,##0.00"),
+            (roi_v, POS_FONT if roi_v > 0 else NEG_FONT if roi_v < 0 else WHT_FONT, CENTER, "0.00"),
+            (int(as_float(w.get("rank", 0))),               DIM_FONT, CENTER, None),
+        ], 1):
+            sc(ws2, ri, ci, v, f=DEF_FILL, fn=fn, al=al, fmt=fmt)
+        ws2.row_dimensions[ri].height = 16
+
+    # ── Sheet 3: Category Summary ──────────────────────────────────────────────
+    ws3 = wb.create_sheet("Category Summary")
+    hdr_row(ws3, [
+        ("Sport", 14), ("Positions", 10), ("Wallets", 9),
+        ("Invested $", 12), ("Cur Value $", 12), ("P&L $", 12),
+        ("ROI %", 8), ("Avg Win %", 10),
+    ])
+    by_cat: dict = {}
+    for pos in positions:
+        cat = pos.get("category", "Other")
+        g   = by_cat.setdefault(cat, {"count": 0, "wallets": set(), "invested": 0.0, "value": 0.0, "pl": 0.0, "wrs": []})
+        g["count"]    += 1
+        for wn in (pos.get("wallets") or [pos.get("wallet", "")]):
+            if wn: g["wallets"].add(wn)
+        g["invested"] += as_float(pos.get("size_usd", 0))
+        g["value"]    += as_float(pos.get("current_value", 0))
+        g["pl"]       += as_float(pos.get("row_pl", 0))
+        wr_ = pos.get("category_win_rate_pct")
+        if wr_ is not None: g["wrs"].append(as_float(wr_))
+    for ri, (cat, g) in enumerate(sorted(by_cat.items(), key=lambda x: -x[1]["pl"]), 2):
+        pl_v  = g["pl"]
+        roi_v = pl_v / g["invested"] * 100 if g["invested"] > 0 else 0.0
+        wr_v  = sum(g["wrs"]) / len(g["wrs"]) if g["wrs"] else 0.0
+        for ci, (v, fn, al, fmt) in enumerate([
+            (cat,                WHT_FONT, LEFT,   None),
+            (g["count"],         DIM_FONT, CENTER, None),
+            (len(g["wallets"]), DIM_FONT,  CENTER, None),
+            (g["invested"],      DIM_FONT, CENTER, "#,##0.00"),
+            (g["value"],         DIM_FONT, CENTER, "#,##0.00"),
+            (pl_v,  POS_FONT if pl_v  > 0 else NEG_FONT if pl_v  < 0 else WHT_FONT, CENTER, "#,##0.00"),
+            (roi_v, POS_FONT if roi_v > 0 else NEG_FONT if roi_v < 0 else WHT_FONT, CENTER, "0.00"),
+            (wr_v,               DIM_FONT, CENTER, "0.0"),
+        ], 1):
+            sc(ws3, ri, ci, v, f=DEF_FILL, fn=fn, al=al, fmt=fmt)
+        ws3.row_dimensions[ri].height = 16
+
+    # ── Sheet 4: Wallet Summary ────────────────────────────────────────────────
+    ws4 = wb.create_sheet("Wallet Summary")
+    hdr_row(ws4, [
+        ("Wallet", 16), ("Positions", 10), ("Invested $", 12),
+        ("Cur Value $", 12), ("P&L $", 12), ("ROI %", 8),
+        ("Avg Conv", 9), ("Sports", 30),
+    ])
+    by_wlt: dict = {}
+    for pos in positions:
+        for wn in (pos.get("wallets") or [pos.get("wallet", "?")]):
+            g = by_wlt.setdefault(wn, {"count": 0, "invested": 0.0, "value": 0.0, "pl": 0.0, "convs": [], "cats": set()})
+            g["count"]    += 1
+            g["invested"] += as_float(pos.get("size_usd", 0))
+            g["value"]    += as_float(pos.get("current_value", 0))
+            g["pl"]       += as_float(pos.get("row_pl", 0))
+            g["convs"].append(as_float(pos.get("conviction", 0)))
+            cat = pos.get("category")
+            if cat: g["cats"].add(cat)
+    for ri, (wn, g) in enumerate(sorted(by_wlt.items(), key=lambda x: -x[1]["pl"]), 2):
+        pl_v  = g["pl"]
+        roi_v = pl_v / g["invested"] * 100 if g["invested"] > 0 else 0.0
+        cv_v  = sum(g["convs"]) / len(g["convs"]) if g["convs"] else 0.0
+        for ci, (v, fn, al, fmt) in enumerate([
+            (wn,                   WHT_FONT, LEFT,   None),
+            (g["count"],           DIM_FONT, CENTER, None),
+            (g["invested"],        DIM_FONT, CENTER, "#,##0.00"),
+            (g["value"],           DIM_FONT, CENTER, "#,##0.00"),
+            (pl_v,  POS_FONT if pl_v  > 0 else NEG_FONT if pl_v  < 0 else WHT_FONT, CENTER, "#,##0.00"),
+            (roi_v, POS_FONT if roi_v > 0 else NEG_FONT if roi_v < 0 else WHT_FONT, CENTER, "0.00"),
+            (round(cv_v, 1),       GLD_FONT, CENTER, "0.0"),
+            (", ".join(sorted(g["cats"])), DIM_FONT, LEFT, None),
+        ], 1):
+            sc(ws4, ri, ci, v, f=DEF_FILL, fn=fn, al=al, fmt=fmt)
+        ws4.row_dimensions[ri].height = 16
+
+    # ── stream ─────────────────────────────────────────────────────────────────
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    fname = f"polytrack_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+    return send_file(buf, as_attachment=True, download_name=fname,
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
 @app.route("/")
 def index():
     return render_template_string(HTML, refresh=REFRESH_SECONDS)
@@ -1568,6 +1775,7 @@ HTML = """<!DOCTYPE html>
   <div id="spinner"></div>
   <div id="meta">–</div>
   <a href="/backtest" style="margin-left:auto;font-size:11px;color:#34c759;opacity:.6;border:1px solid #34c759;border-radius:8px;padding:2px 8px;white-space:nowrap">Backtest →</a>
+  <a href="/export" style="font-size:11px;color:#e6a817;border:1px solid #e6a817;border-radius:8px;padding:2px 8px;white-space:nowrap;opacity:.75" title="Download Excel workbook">↓ Export XLSX</a>
 </header>
 
 <div class="controls">
