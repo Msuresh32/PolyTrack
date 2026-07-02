@@ -909,6 +909,76 @@ def dedup_by_market(cards: list) -> list:
     return result
 
 
+def collapse_by_event(cards: list) -> list:
+    """
+    Fold market-level cards into one card per event slug.
+    When a wallet has positions across multiple correlated markets in the same
+    event (e.g. match-winner + BTTS + over/under), this collapses them into one
+    aggregated card so hedged exposure isn't counted as separate positions.
+    """
+    grouped: dict[tuple, list] = {}
+    for card in cards:
+        event = card.get("event_slug") or card.get("event_id") or str(card.get("market_id", ""))
+        key = (event, card.get("category", ""), card.get("resolution_time") or card.get("end_date") or "")
+        grouped.setdefault(key, []).append(card)
+
+    result = []
+    for group_cards in grouped.values():
+        if len(group_cards) == 1:
+            result.append(group_cards[0])
+            continue
+
+        rep  = max(group_cards, key=lambda c: as_float(c.get("conviction")))
+        card = rep.copy()
+
+        total_cost       = sum(as_float(c.get("size_usd") or c.get("row_cost")) for c in group_cards)
+        total_value      = sum(as_float(c.get("current_value") or c.get("row_current_value")) for c in group_cards)
+        total_realized   = sum(as_float(c.get("row_realized_pl")) for c in group_cards)
+        total_unrealized = sum(as_float(c.get("row_unrealized_pl")) for c in group_cards)
+        total_pl         = total_realized + total_unrealized
+
+        all_wallets: set = set()
+        all_addrs: set   = set()
+        for c in group_cards:
+            all_wallets.update(c.get("wallets") or ([c.get("wallet")] if c.get("wallet") else []))
+            all_addrs.update(c.get("wallet_addresses") or ([c.get("addr")] if c.get("addr") else []))
+
+        wallet_label = rep.get("wallet", "")
+        if len(all_wallets) > 1:
+            wallet_label = f"{len(all_wallets)} aligned"
+
+        event_slug  = rep.get("event_slug", "")
+        event_title = " ".join(w.capitalize() for w in event_slug.split("-")) if event_slug else rep.get("market", "?")
+
+        card.update({
+            "market":             event_title,
+            "outcome":            "Multi",
+            "side":               "Multi",
+            "event_market_count": len(group_cards),
+            "sub_markets":        [c.get("market", "") for c in group_cards],
+            "wallet":             wallet_label,
+            "wallets":            sorted(all_wallets),
+            "wallet_addresses":   sorted(all_addrs),
+            "sharp_wallets":      ", ".join(sorted(all_wallets)),
+            "sharp_wallet_count": len(all_wallets),
+            "size_usd":           round(total_cost, 2),
+            "current_value":      round(total_value, 2),
+            "row_cost":           round(total_cost, 2),
+            "row_current_value":  round(total_value, 2),
+            "row_realized_pl":    round(total_realized, 2),
+            "row_unrealized_pl":  round(total_unrealized, 2),
+            "row_pl":             round(total_pl, 2),
+            "row_roi_pct":        round(total_pl / total_cost * 100, 2) if total_cost > 0 else 0.0,
+            "avg_price":          0,
+            "cur_price":          0,
+            "avg_odds":           "n/a",
+            "cur_odds":           "n/a",
+        })
+        result.append(card)
+
+    return result
+
+
 def load_fill_history() -> dict:
     history = {
         "wallet_sizes": {},
@@ -1145,6 +1215,7 @@ def build_positions() -> list:
     attach_position_details(result, category_source_rows)
     result = collapse_position_cards(result)
     result = dedup_by_market(result)
+    result = collapse_by_event(result)
     result.sort(key=lambda x: x["conviction"], reverse=True)
     return result
 
@@ -1422,8 +1493,9 @@ HTML = """<!DOCTYPE html>
   /* Sub-row: outcome + stats as plain text */
   .card-sub { display: flex; align-items: center; gap: 0; font-size: 11px; color: #5a7a68; flex-wrap: nowrap; overflow: hidden; }
   .card-sub .sep { margin: 0 5px; color: #2a3a30; }
-  .side-yes { color: #34c759; font-weight: 700; }
-  .side-no  { color: #f0606e; font-weight: 700; }
+  .side-yes   { color: #34c759; font-weight: 700; }
+  .side-no    { color: #f0606e; font-weight: 700; }
+  .side-multi { color: #e6a817; font-weight: 700; }
   .sub-pos  { color: #34c759; }
   .sub-neg  { color: #f0606e; }
 
@@ -1724,8 +1796,9 @@ HTML = """<!DOCTYPE html>
     const aligned = details.aligned_wallets || [];
     const opposing = details.opposing_wallets || [];
 
-    const outcome = s.selected_side || r.outcome || '';
-    const sideCls = outcome === 'Yes' ? 'side-yes' : 'side-no';
+    const isMulti = r.outcome === 'Multi';
+    const outcome = isMulti ? 'Multi' : (s.selected_side || r.outcome || '');
+    const sideCls = isMulti ? 'side-multi' : (outcome === 'Yes' ? 'side-yes' : 'side-no');
     const entryP  = r.avg_price || r.entry_price || 0;
     const curP    = r.cur_price || r.current_price || 0;
     const roi     = r.category_roi_pct || 0;
@@ -1738,14 +1811,22 @@ HTML = """<!DOCTYPE html>
       `<span class="cat-badge">${esc(s.category||r.category)}</span>
        <span class="${sideCls}" style="margin-left:2px">${esc(outcome)}</span>`;
     document.getElementById('modalTitle').textContent = s.market_title || r.market || '';
-    document.getElementById('modalSub').textContent =
-      `Resolves ${s.resolution_time||r.end_date||'–'}`;
+    if (isMulti && r.sub_markets && r.sub_markets.length > 1) {
+      document.getElementById('modalSub').innerHTML =
+        `Resolves ${s.resolution_time||r.end_date||'–'} &nbsp;&middot;&nbsp; `
+        + r.sub_markets.map(m => `<span class="chip">${esc(m)}</span>`).join(' ');
+    } else {
+      document.getElementById('modalSub').textContent =
+        `Resolves ${s.resolution_time||r.end_date||'–'}`;
+    }
 
     const sep = `<span class="dsl-sep">&middot;</span>`;
+    const priceStr = isMulti ? '' :
+      sep + `${sl(fmt(entryP,0)+'&#162;')} &rarr; ${sl(fmt(curP,0)+'&#162;','dsl-hl')}`;
     document.getElementById('drawerStatline').innerHTML =
       `${sl('$'+fmt(r.size_usd||r.row_cost||0),'dsl-hl')} invested`
       + sep + `${sl(mult+'x','dsl-hl')} bet size`
-      + sep + `${sl(fmt(entryP,0)+'&#162;')} &rarr; ${sl(fmt(curP,0)+'&#162;','dsl-hl')}`
+      + priceStr
       + sep + `cat ROI ${sl(sign(roi)+roi.toFixed(1)+'%', roiCls)}`
       + sep + `win ${sl(wr+'%','dsl-hl')} (${wl})`
       + sep + `tail ${sl('$'+fmt(r.tail_stake||0),'dsl-hl')}`;
@@ -1837,7 +1918,8 @@ HTML = """<!DOCTYPE html>
       const wl  = r.category_wins_losses || `${r.category_wins||'?'}-${r.category_losses||'?'}`;
       const ico = sportIcon(r.category);
 
-      const sideCls = r.outcome === 'Yes' ? 'side-yes' : 'side-no';
+      const isMulti = r.outcome === 'Multi';
+      const sideCls = isMulti ? 'side-multi' : (r.outcome === 'Yes' ? 'side-yes' : 'side-no');
       const names   = alignedNames(r);
       const walletLabel = names.length > 1 ? `${names.length} aligned` : esc(names[0] || r.wallet || '');
 
@@ -1869,22 +1951,27 @@ HTML = """<!DOCTYPE html>
             &nbsp;&middot;&nbsp;${esc(walletLabel)}
             &nbsp;&middot;&nbsp;${esc(endLabel)}
             &nbsp;&middot;&nbsp;<span class="hl">$${fmt(r.size_usd||r.row_cost||0)}</span>
-            &nbsp;&middot;&nbsp;<span class="${pDir}">${fmt(entryP,0)}&#162;&rarr;${fmt(curP,0)}&#162;</span>
+            ${isMulti ? '' : `&nbsp;&middot;&nbsp;<span class="${pDir}">${fmt(entryP,0)}&#162;&rarr;${fmt(curP,0)}&#162;</span>`}
             &nbsp;&middot;&nbsp;<span class="${mCls}">${mult.toFixed(1)}x</span>
             &nbsp;&middot;&nbsp;ROI&nbsp;<span class="${rCls}">${sign(roi)}${roi.toFixed(1)}%</span>
           </div>
           <div class="card-sub">
-            <span class="${sideCls}">${esc(r.outcome)}</span>
-            ${sep}<span>${fmt(curP,0)}&#162;&nbsp;<span style="color:#4d6659">${esc(curOdds)}</span></span>
+            ${isMulti
+              ? `<span class="side-multi">${r.event_market_count} markets</span>${sep}<span style="color:#4d6659;font-size:10px">${(r.sub_markets||[]).slice(0,2).map(m=>esc(m)).join(' &middot; ')+(r.sub_markets&&r.sub_markets.length>2?' &hellip;':'')}</span>`
+              : `<span class="${sideCls}">${esc(r.outcome)}</span>${sep}<span>${fmt(curP,0)}&#162;&nbsp;<span style="color:#4d6659">${esc(curOdds)}</span></span>`
+            }
             ${sep}<span>win ${wr}%&nbsp;<span style="color:#4d6659">(${wl})</span></span>
             ${sep}<span>${(r.pct_portfolio||0).toFixed(1)}% of portfolio</span>
             ${r.tail_stake ? `${sep}<span>tail $${fmt(r.tail_stake)}</span>` : ''}
           </div>
         </div>
         <div class="card-right">
-          <div class="shares-tag">${fmt(r.shares||0,0)} shares</div>
+          <div class="shares-tag">${isMulti ? (r.event_market_count+' markets') : fmt(r.shares||0,0)+' shares'}</div>
           <div class="value-tag">$${fmt(r.current_value||0)}</div>
-          <div class="price-badge">${fmt(curP,0)}&#162;</div>
+          ${isMulti
+            ? `<div class="price-badge" style="color:#e6a817;border-color:#4a3800;background:#1e1600">HEDGE</div>`
+            : `<div class="price-badge">${fmt(curP,0)}&#162;</div>`
+          }
         </div>
       </article>`;
     }).join('');
